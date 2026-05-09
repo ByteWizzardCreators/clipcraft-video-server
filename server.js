@@ -1,9 +1,6 @@
 /**
  * ClipCraft Video Generator
  * Servidor para generar videos con FFmpeg
- * 
- * Deploy en: https://glitch.com o https://replit.com
- * Estos servicios ya tienen FFmpeg instalado
  */
 
 const express = require('express');
@@ -15,13 +12,17 @@ const os = require('os');
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '50mb' }));
+app.use(express.json({ limit: '100mb' }));
 
 const PORT = process.env.PORT || 3000;
 const TEMP_DIR = os.tmpdir();
 
 // Configurar FFmpeg
-ffmpeg.setFfmpegPath('/usr/bin/ffmpeg');
+try {
+  ffmpeg.setFfmpegPath('/usr/bin/ffmpeg');
+} catch (e) {
+  console.log('FFmpeg path already set');
+}
 
 app.post('/generate', async (req, res) => {
   const { sessionId, photos, audio, duration, musicStart } = req.body;
@@ -36,65 +37,109 @@ app.post('/generate', async (req, res) => {
     const sessionDir = path.join(TEMP_DIR, `clip_${Date.now()}`);
     fs.mkdirSync(sessionDir, { recursive: true });
 
-    // Descargar fotos
+    // Guardar fotos desde base64
     const photoPaths = [];
     for (let i = 0; i < photos.length; i++) {
       const photoPath = path.join(sessionDir, `p${i}.jpg`);
-      const photoData = Buffer.from(photos[i].replace(/^data:image\/\w+;base64,/, ''), 'base64');
+      // Remover el prefijo data:image si existe
+      let base64Data = photos[i];
+      if (base64Data.includes(',')) {
+        base64Data = base64Data.split(',')[1];
+      }
+      const photoData = Buffer.from(base64Data, 'base64');
       fs.writeFileSync(photoPath, photoData);
       photoPaths.push(photoPath);
+      console.log(`Foto ${i+1} guardada`);
     }
 
-    // Crear video con slideshow de fotos
+    // Crear lista de archivos para FFmpeg
+    const listPath = path.join(sessionDir, 'list.txt');
+    let listContent = '';
+    const photoDuration = Math.floor(duration / photos.length);
+    
+    for (let i = 0; i < photos.length; i++) {
+      listContent += `file 'p${i}.jpg'\n`;
+      listContent += `duration ${photoDuration}\n`;
+    }
+    // Repetir la última imagen para el frame final
+    listContent += `file 'p${photos.length - 1}.jpg'\n`;
+    
+    fs.writeFileSync(listPath, listContent);
+
     const outputPath = path.join(sessionDir, 'output.mp4');
-    const photoDuration = duration / photos.length;
 
-    // Build FFmpeg command
-    let command = ffmpeg();
-    
-    // Agregar fotos como input
-    for (const photoPath of photoPaths) {
-      command = command.input(photoPath).loop(photoDuration);
-    }
-    
-    // Agregar transición y escala
-    command = command
-      .complexFilter([
-        `scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2`,
-        `fade=t=in:st=0:d=1,fade=t=out:st=${duration-1}:d=1`
+    // Build FFmpeg command usando el archivo de lista
+    let command = ffmpeg()
+      .input(listPath)
+      .inputFormat('concat')
+      .inputFPS(1)
+      .videoFilters([
+        'scale=1280:720:force_original_aspect_ratio=decrease',
+        'pad=1280:720:(ow-iw)/2:(oh-ih)/2'
       ])
       .outputOptions([
         `-t ${duration}`,
         '-c:v libx264',
         '-pix_fmt yuv420p',
-        '-preset fast'
+        '-preset ultrafast',
+        '-movflags +faststart'
       ]);
 
     // Agregar audio si existe
-    if (audio) {
-      const audioData = Buffer.from(audio.replace(/^data:audio\/\w+;base64,/, ''), 'base64');
-      const audioPath = path.join(sessionDir, 'audio.mp3');
-      fs.writeFileSync(audioPath, audioData);
-      
-      command = command
-        .input(audioPath)
-        .outputOptions([
-          '-c:a aac',
-          '-shortest',
-          `-ss ${musicStart || 0}`
-        ]);
+    if (audio && audio !== 'null') {
+      try {
+        const audioPath = path.join(sessionDir, 'audio.mp3');
+        let audioDataStr = audio;
+        if (audioDataStr.includes(',')) {
+          audioDataStr = audioDataStr.split(',')[1];
+        }
+        const audioData = Buffer.from(audioDataStr, 'base64');
+        fs.writeFileSync(audioPath, audioData);
+        
+        command = command
+          .input(audioPath)
+          .inputOptions(['-ss 0'])
+          .outputOptions([
+            '-c:a aac',
+            '-b:a 128k',
+            '-shortest'
+          ]);
+        console.log('Audio agregado');
+      } catch (audioErr) {
+        console.log('Error con audio:', audioErr.message);
+      }
     }
 
+    console.log('Ejecutando FFmpeg...');
+    
     await new Promise((resolve, reject) => {
-      command.on('end', resolve).on('error', reject).save(outputPath);
+      command.on('progress', (progress) => {
+        console.log(`Procesando: ${Math.round(progress.percent || 0)}%`);
+      });
+      command.on('end', () => {
+        console.log('FFmpeg terminó');
+        resolve();
+      });
+      command.on('error', (err) => {
+        console.log('FFmpeg error:', err.message);
+        reject(err);
+      });
+      command.save(outputPath);
     });
+
+    // Verificar que el archivo existe
+    if (!fs.existsSync(outputPath)) {
+      throw new Error('El video no se generó');
+    }
 
     // Leer video generado
     const videoBuffer = fs.readFileSync(outputPath);
     const videoBase64 = videoBuffer.toString('base64');
 
     // Limpiar
-    fs.rmSync(sessionDir, { recursive: true, force: true });
+    try {
+      fs.rmSync(sessionDir, { recursive: true, force: true });
+    } catch (cleanupErr) {}
 
     res.json({
       success: true,
